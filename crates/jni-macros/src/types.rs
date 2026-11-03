@@ -1100,13 +1100,22 @@ impl TypeMappings {
     }
 
     /// Get an iterator over all Rust types
+    ///
+    /// Sorted by Rust type path: the set's own order changes from one compiler run to the
+    /// next, and generated code must not depend on it (reproducible builds).
     pub fn rust_types(&self) -> impl Iterator<Item = &Rc<RustType>> {
-        self.rust_types.iter()
+        let mut v: Vec<_> = self.rust_types.iter().collect();
+        v.sort_by(|a, b| a.path().cmp(b.path()));
+        v.into_iter()
     }
 
     /// Get an iterator over rust_path -> java_class mappings
+    ///
+    /// Sorted by Rust type path, for the same reason as [`Self::rust_types`].
     pub fn rust_to_java_iter(&self) -> impl Iterator<Item = (&Rc<RustType>, &Rc<JavaClassName>)> {
-        self.rust_to_java.iter()
+        let mut v: Vec<_> = self.rust_to_java.iter().collect();
+        v.sort_by(|a, b| a.0.path().cmp(b.0.path()));
+        v.into_iter()
     }
 
     /// Get the jni crate path
