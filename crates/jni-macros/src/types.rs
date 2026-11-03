@@ -23,7 +23,7 @@ pub fn path_to_string_no_spaces(path: &syn::Path) -> String {
 }
 
 /// Represents a primitive Java type
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrimitiveType {
     Void,
     Boolean,
@@ -376,7 +376,7 @@ enum RustTypeTarget {
     },
 }
 
-// Ignore the 'is_builtin' field for equality and hashing
+// Ignore the 'is_builtin' field for equality, ordering and hashing
 
 impl PartialEq for RustTypeTarget {
     fn eq(&self, other: &Self) -> bool {
@@ -401,6 +401,44 @@ impl PartialEq for RustTypeTarget {
         }
     }
 }
+
+impl Ord for RustTypeTarget {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (
+                RustTypeTarget::Primitive {
+                    primitive: p1,
+                    path: path1,
+                    ..
+                },
+                RustTypeTarget::Primitive {
+                    primitive: p2,
+                    path: path2,
+                    ..
+                },
+            ) => path1.cmp(path2).then_with(|| p1.cmp(p2)),
+            (
+                RustTypeTarget::Reference { path: path1, .. },
+                RustTypeTarget::Reference { path: path2, .. },
+            ) => path1.cmp(path2),
+            (
+                RustTypeTarget::Primitive { path: path1, .. },
+                RustTypeTarget::Reference { path: path2, .. },
+            ) => path1.cmp(path2).then(std::cmp::Ordering::Less),
+            (
+                RustTypeTarget::Reference { path: path1, .. },
+                RustTypeTarget::Primitive { path: path2, .. },
+            ) => path1.cmp(path2).then(std::cmp::Ordering::Greater),
+        }
+    }
+}
+
+impl PartialOrd for RustTypeTarget {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl std::hash::Hash for RustTypeTarget {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match &self {
@@ -417,7 +455,7 @@ impl std::hash::Hash for RustTypeTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RustType {
     target: RustTypeTarget,
 }
@@ -531,13 +569,15 @@ pub struct TypeMappings {
     /// types will still have a `jni::` prefix, and it's only the
     /// `RustType::path` that will have the renamed crate path.
     alias_to_rust: std::collections::HashMap<String, Rc<RustType>>,
-    /// Set of all known Rust types
-    rust_types: std::collections::HashSet<Rc<RustType>>,
+    /// Set of all known Rust types, ordered so that code generated from it is deterministic
+    rust_types: std::collections::BTreeSet<Rc<RustType>>,
     /// Maps `RustType::path`s to Java class names
     ///
     /// Only includes the canonical Rust type paths, so make sure to resolve
     /// aliases like "JString" before looking up in this map.
-    rust_to_java: std::collections::HashMap<Rc<RustType>, Rc<JavaClassName>>,
+    ///
+    /// Ordered so that code generated from it is deterministic.
+    rust_to_java: std::collections::BTreeMap<Rc<RustType>, Rc<JavaClassName>>,
     /// Reverse mapping from Java class names to the canonical RustType path
     java_to_rust: std::collections::HashMap<Rc<JavaClassName>, Rc<RustType>>,
     /// Set of core Java types that can not be mapped to non-jni-crate types
@@ -562,8 +602,8 @@ impl TypeMappings {
     pub fn new(jni_crate: &syn::Path) -> Self {
         let mut type_mappings = Self {
             alias_to_rust: std::collections::HashMap::new(),
-            rust_types: std::collections::HashSet::new(),
-            rust_to_java: std::collections::HashMap::new(),
+            rust_types: std::collections::BTreeSet::new(),
+            rust_to_java: std::collections::BTreeMap::new(),
             java_to_rust: std::collections::HashMap::new(),
             core_java: std::collections::HashSet::new(),
             jni_crate: jni_crate.clone(),
@@ -1099,12 +1139,13 @@ impl TypeMappings {
         self.java_to_rust.keys()
     }
 
-    /// Get an iterator over all Rust types
+    /// Get an iterator over all Rust types, in a fixed order (by Rust type path)
     pub fn rust_types(&self) -> impl Iterator<Item = &Rc<RustType>> {
         self.rust_types.iter()
     }
 
-    /// Get an iterator over rust_path -> java_class mappings
+    /// Get an iterator over rust_path -> java_class mappings, in a fixed order (by Rust type
+    /// path)
     pub fn rust_to_java_iter(&self) -> impl Iterator<Item = (&Rc<RustType>, &Rc<JavaClassName>)> {
         self.rust_to_java.iter()
     }
@@ -1386,6 +1427,42 @@ pub fn generate_type_mapping_checks(type_mappings: &TypeMappings, jni: &syn::Pat
     } else {
         quote! {
             #(#type_checks)*
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generated code walks these, so their order must not depend on hashing (it changes
+    /// from one compiler run to the next, which made builds that use the macros
+    /// non-reproducible).
+    #[test]
+    fn type_mappings_iterate_in_a_fixed_order() {
+        let mut types = TypeMappings::new(&syn::parse_quote!(::jni));
+        for name in ["Zeta", "Alpha", "Mid"] {
+            let java_class = JavaClassName {
+                package: vec!["com".into(), "example".into()],
+                class: name.into(),
+            };
+            types
+                .insert_ref_type(name, &format!("crate::{name}"), java_class, false)
+                .unwrap();
+        }
+
+        let paths: Vec<String> = types.rust_types().map(|t| t.path().to_string()).collect();
+        assert!(paths.len() > 3);
+        assert!(paths.is_sorted(), "{paths:?}");
+
+        let mapped: Vec<String> = types
+            .rust_to_java_iter()
+            .map(|(t, _)| t.path().to_string())
+            .collect();
+        assert!(mapped.len() > 3);
+        assert!(mapped.is_sorted(), "{mapped:?}");
+        for name in ["crate::Alpha", "crate::Mid", "crate::Zeta"] {
+            assert!(mapped.iter().any(|p| p == name), "{name} in {mapped:?}");
         }
     }
 }
