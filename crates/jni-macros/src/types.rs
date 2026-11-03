@@ -1318,11 +1318,23 @@ impl Parse for AbiCheck {
 pub fn generate_type_mapping_checks(type_mappings: &TypeMappings, jni: &syn::Path) -> TokenStream {
     let mut type_checks = Vec::new();
 
-    // Generate runtime checks for all type mappings
-    for (rust_type, java_class) in type_mappings
+    // The checks are emitted sorted by Rust type path: the mappings are kept in a HashMap and
+    // a HashSet, whose iteration order changes from one compiler run to the next, and the
+    // generated code (and so the build) must not depend on it.
+    let mut mappings: Vec<_> = type_mappings
         .rust_to_java_iter()
         .filter(|(rust_type, _)| !rust_type.is_builtin())
-    {
+        .collect();
+    mappings.sort_by(|a, b| a.0.path().cmp(b.0.path()));
+    let mut primitives: Vec<_> = type_mappings
+        .rust_types()
+        .filter(|rt| rt.primitive().is_some())
+        .filter(|rt| !rt.is_builtin())
+        .collect();
+    primitives.sort_by(|a, b| a.path().cmp(b.path()));
+
+    // Generate runtime checks for all type mappings
+    for (rust_type, java_class) in mappings {
         let rust_path: syn::Path = syn::parse_str(rust_type.path())
             .unwrap_or_else(|_| panic!("Invalid Rust type path: {}", &rust_type.path()));
 
@@ -1349,11 +1361,7 @@ pub fn generate_type_mapping_checks(type_mappings: &TypeMappings, jni: &syn::Pat
     }
 
     // Generate compile-time size and alignment checks for primitive type mappings
-    for rust_type in type_mappings
-        .rust_types()
-        .filter(|rt| rt.primitive().is_some())
-        .filter(|rt| !rt.is_builtin())
-    {
+    for rust_type in primitives {
         let rust_path: syn::Path = syn::parse_str(rust_type.path())
             .unwrap_or_else(|_| panic!("Invalid Rust type path: {}", &rust_type.path()));
 
@@ -1386,6 +1394,44 @@ pub fn generate_type_mapping_checks(type_mappings: &TypeMappings, jni: &syn::Pat
     } else {
         quote! {
             #(#type_checks)*
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each TypeMappings gets its own hash seed, so two of them with the same mappings iterate
+    /// in different orders; the generated checks must still be the same.
+    #[test]
+    fn type_mapping_checks_are_deterministic() {
+        let jni: syn::Path = syn::parse_quote!(::jni);
+        let generate = || {
+            let mut types = TypeMappings::new(&jni);
+            for i in 0..16 {
+                let java_class = JavaClassName {
+                    package: vec!["com".into(), "example".into()],
+                    class: format!("C{i}"),
+                };
+                types
+                    .insert_ref_type(&format!("R{i}"), &format!("crate::R{i}"), java_class, false)
+                    .unwrap();
+                types
+                    .insert_prim_type(
+                        &format!("P{i}"),
+                        PrimitiveType::Int,
+                        &format!("crate::P{i}"),
+                        false,
+                    )
+                    .unwrap();
+            }
+            generate_type_mapping_checks(&types, &jni).to_string()
+        };
+        let first = generate();
+        assert!(first.contains("crate :: R15") && first.contains("crate :: P15"));
+        for _ in 0..8 {
+            assert_eq!(generate(), first);
         }
     }
 }
