@@ -23,7 +23,7 @@ pub fn path_to_string_no_spaces(path: &syn::Path) -> String {
 }
 
 /// Represents a primitive Java type
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrimitiveType {
     Void,
     Boolean,
@@ -401,6 +401,27 @@ impl PartialEq for RustTypeTarget {
         }
     }
 }
+// Ordered by path (then kind and primitive), consistently with the equality above. The
+// ordered collections in `TypeMappings` iterate in this order, so the code generated from
+// them does not depend on hashing (which changes from one compiler run to the next).
+impl Ord for RustTypeTarget {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let key = |t: &Self| match t {
+            RustTypeTarget::Primitive {
+                primitive, path, ..
+            } => (path.clone(), Some(primitive.clone())),
+            RustTypeTarget::Reference { path, .. } => (path.clone(), None),
+        };
+        key(self).cmp(&key(other))
+    }
+}
+
+impl PartialOrd for RustTypeTarget {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl std::hash::Hash for RustTypeTarget {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match &self {
@@ -417,7 +438,7 @@ impl std::hash::Hash for RustTypeTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RustType {
     target: RustTypeTarget,
 }
@@ -531,13 +552,14 @@ pub struct TypeMappings {
     /// types will still have a `jni::` prefix, and it's only the
     /// `RustType::path` that will have the renamed crate path.
     alias_to_rust: std::collections::HashMap<String, Rc<RustType>>,
-    /// Set of all known Rust types
-    rust_types: std::collections::HashSet<Rc<RustType>>,
+    /// Set of all known Rust types (ordered, see [`RustType`]'s `Ord`)
+    rust_types: std::collections::BTreeSet<Rc<RustType>>,
     /// Maps `RustType::path`s to Java class names
     ///
     /// Only includes the canonical Rust type paths, so make sure to resolve
     /// aliases like "JString" before looking up in this map.
-    rust_to_java: std::collections::HashMap<Rc<RustType>, Rc<JavaClassName>>,
+    /// (ordered, see [`RustType`]'s `Ord`).
+    rust_to_java: std::collections::BTreeMap<Rc<RustType>, Rc<JavaClassName>>,
     /// Reverse mapping from Java class names to the canonical RustType path
     java_to_rust: std::collections::HashMap<Rc<JavaClassName>, Rc<RustType>>,
     /// Set of core Java types that can not be mapped to non-jni-crate types
@@ -562,8 +584,8 @@ impl TypeMappings {
     pub fn new(jni_crate: &syn::Path) -> Self {
         let mut type_mappings = Self {
             alias_to_rust: std::collections::HashMap::new(),
-            rust_types: std::collections::HashSet::new(),
-            rust_to_java: std::collections::HashMap::new(),
+            rust_types: std::collections::BTreeSet::new(),
+            rust_to_java: std::collections::BTreeMap::new(),
             java_to_rust: std::collections::HashMap::new(),
             core_java: std::collections::HashSet::new(),
             jni_crate: jni_crate.clone(),
@@ -1099,23 +1121,15 @@ impl TypeMappings {
         self.java_to_rust.keys()
     }
 
-    /// Get an iterator over all Rust types
-    ///
-    /// Sorted by Rust type path: the set's own order changes from one compiler run to the
-    /// next, and generated code must not depend on it (reproducible builds).
+    /// Get an iterator over all Rust types, in a fixed order (by Rust type path)
     pub fn rust_types(&self) -> impl Iterator<Item = &Rc<RustType>> {
-        let mut v: Vec<_> = self.rust_types.iter().collect();
-        v.sort_by(|a, b| a.path().cmp(b.path()));
-        v.into_iter()
+        self.rust_types.iter()
     }
 
-    /// Get an iterator over rust_path -> java_class mappings
-    ///
-    /// Sorted by Rust type path, for the same reason as [`Self::rust_types`].
+    /// Get an iterator over rust_path -> java_class mappings, in a fixed order (by Rust type
+    /// path)
     pub fn rust_to_java_iter(&self) -> impl Iterator<Item = (&Rc<RustType>, &Rc<JavaClassName>)> {
-        let mut v: Vec<_> = self.rust_to_java.iter().collect();
-        v.sort_by(|a, b| a.0.path().cmp(b.0.path()));
-        v.into_iter()
+        self.rust_to_java.iter()
     }
 
     /// Get the jni crate path
