@@ -1100,13 +1100,22 @@ impl TypeMappings {
     }
 
     /// Get an iterator over all Rust types
+    ///
+    /// Sorted by Rust type path: the set's own order changes from one compiler run to the
+    /// next, and generated code must not depend on it (reproducible builds).
     pub fn rust_types(&self) -> impl Iterator<Item = &Rc<RustType>> {
-        self.rust_types.iter()
+        let mut v: Vec<_> = self.rust_types.iter().collect();
+        v.sort_by(|a, b| a.path().cmp(b.path()));
+        v.into_iter()
     }
 
     /// Get an iterator over rust_path -> java_class mappings
+    ///
+    /// Sorted by Rust type path, for the same reason as [`Self::rust_types`].
     pub fn rust_to_java_iter(&self) -> impl Iterator<Item = (&Rc<RustType>, &Rc<JavaClassName>)> {
-        self.rust_to_java.iter()
+        let mut v: Vec<_> = self.rust_to_java.iter().collect();
+        v.sort_by(|a, b| a.0.path().cmp(b.0.path()));
+        v.into_iter()
     }
 
     /// Get the jni crate path
@@ -1386,6 +1395,42 @@ pub fn generate_type_mapping_checks(type_mappings: &TypeMappings, jni: &syn::Pat
     } else {
         quote! {
             #(#type_checks)*
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generated code walks these, so their order must not depend on hashing (it changes
+    /// from one compiler run to the next, which made builds that use the macros
+    /// non-reproducible).
+    #[test]
+    fn type_mappings_iterate_in_a_fixed_order() {
+        let mut types = TypeMappings::new(&syn::parse_quote!(::jni));
+        for name in ["Zeta", "Alpha", "Mid"] {
+            let java_class = JavaClassName {
+                package: vec!["com".into(), "example".into()],
+                class: name.into(),
+            };
+            types
+                .insert_ref_type(name, &format!("crate::{name}"), java_class, false)
+                .unwrap();
+        }
+
+        let paths: Vec<String> = types.rust_types().map(|t| t.path().to_string()).collect();
+        assert!(paths.len() > 3);
+        assert!(paths.is_sorted(), "{paths:?}");
+
+        let mapped: Vec<String> = types
+            .rust_to_java_iter()
+            .map(|(t, _)| t.path().to_string())
+            .collect();
+        assert!(mapped.len() > 3);
+        assert!(mapped.is_sorted(), "{mapped:?}");
+        for name in ["crate::Alpha", "crate::Mid", "crate::Zeta"] {
+            assert!(mapped.iter().any(|p| p == name), "{name} in {mapped:?}");
         }
     }
 }
